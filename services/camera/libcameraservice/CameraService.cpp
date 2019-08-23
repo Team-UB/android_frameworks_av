@@ -95,6 +95,9 @@ using vendor::lineage::camera::motor::V1_0::ICameraMotor;
 // Logging support -- this is for debugging only
 // Use "adb shell dumpsys media.camera -v 1" to change it.
 volatile int32_t gLogLevel = 0;
+#ifdef TARGET_MOTORIZED_CAMERA
+time_t motorTimeElapsed = 0;
+#endif
 
 #define LOG1(...) ALOGD_IF(gLogLevel >= 1, __VA_ARGS__);
 #define LOG2(...) ALOGD_IF(gLogLevel >= 2, __VA_ARGS__);
@@ -1302,6 +1305,19 @@ Status CameraService::connectHelper(const sp<CALLBACK>& cameraCb, const String8&
 
     String8 clientName8(clientPackageName);
 
+#ifdef TARGET_MOTORIZED_CAMERA
+    std::string camId = cameraId.string();
+    time_t now = time(0);
+    double dif = difftime (now,motorTimeElapsed);
+    if (camId.compare("1") == 0) {
+        if (dif < 0.5) {
+            usleep (500000);
+        }
+        property_set("sys.camera.motor.direction", "up");
+        motorTimeElapsed = time(0);
+    }
+#endif
+
     int originalClientPid = 0;
 
     ALOGI("CameraService::connect call (PID %d \"%s\", camera ID %s) for HAL version %s and "
@@ -2046,31 +2062,37 @@ sp<MediaPlayer> CameraService::newMediaPlayer(const char *file) {
     return mp;
 }
 
-void CameraService::loadSound() {
+void CameraService::increaseSoundRef() {
+    Mutex::Autolock lock(mSoundLock);
+    mSoundRef++;
+}
+
+void CameraService::loadSoundLocked(sound_kind kind) {
     ATRACE_CALL();
 
-    Mutex::Autolock lock(mSoundLock);
-    LOG1("CameraService::loadSound ref=%d", mSoundRef);
-    if (mSoundRef++) return;
-
-    mSoundPlayer[SOUND_SHUTTER] = newMediaPlayer("/product/media/audio/ui/camera_click.ogg");
-    if (mSoundPlayer[SOUND_SHUTTER] == nullptr) {
-        mSoundPlayer[SOUND_SHUTTER] = newMediaPlayer("/system/media/audio/ui/camera_click.ogg");
-    }
-    mSoundPlayer[SOUND_RECORDING_START] = newMediaPlayer("/product/media/audio/ui/VideoRecord.ogg");
-    if (mSoundPlayer[SOUND_RECORDING_START] == nullptr) {
-        mSoundPlayer[SOUND_RECORDING_START] =
+    LOG1("CameraService::loadSoundLocked ref=%d", mSoundRef);
+    if (SOUND_SHUTTER == kind && mSoundPlayer[SOUND_SHUTTER] == NULL) {
+        mSoundPlayer[SOUND_SHUTTER] = newMediaPlayer("/product/media/audio/ui/camera_click.ogg");
+        if (mSoundPlayer[SOUND_SHUTTER] == nullptr) {
+            mSoundPlayer[SOUND_SHUTTER] = newMediaPlayer("/system/media/audio/ui/camera_click.ogg");
+        }
+    } else if (SOUND_RECORDING_START == kind && mSoundPlayer[SOUND_RECORDING_START] ==  NULL) {
+        mSoundPlayer[SOUND_RECORDING_START] = newMediaPlayer("/product/media/audio/ui/VideoRecord.ogg");
+        if (mSoundPlayer[SOUND_RECORDING_START] == nullptr) {
+            mSoundPlayer[SOUND_RECORDING_START] =
                 newMediaPlayer("/system/media/audio/ui/VideoRecord.ogg");
-    }
-    mSoundPlayer[SOUND_RECORDING_STOP] = newMediaPlayer("/product/media/audio/ui/VideoStop.ogg");
-    if (mSoundPlayer[SOUND_RECORDING_STOP] == nullptr) {
-        mSoundPlayer[SOUND_RECORDING_STOP] = newMediaPlayer("/system/media/audio/ui/VideoStop.ogg");
+        }
+    } else if (SOUND_RECORDING_STOP == kind && mSoundPlayer[SOUND_RECORDING_STOP] == NULL) {
+        mSoundPlayer[SOUND_RECORDING_STOP] = newMediaPlayer("/product/media/audio/ui/VideoStop.ogg");
+        if (mSoundPlayer[SOUND_RECORDING_STOP] == nullptr) {
+            mSoundPlayer[SOUND_RECORDING_STOP] = newMediaPlayer("/system/media/audio/ui/VideoStop.ogg");
+        }
     }
 }
 
-void CameraService::releaseSound() {
+void CameraService::decreaseSoundRef() {
     Mutex::Autolock lock(mSoundLock);
-    LOG1("CameraService::releaseSound ref=%d", mSoundRef);
+    LOG1("CameraService::decreaseSoundRef ref=%d", mSoundRef);
     if (--mSoundRef) return;
 
     for (int i = 0; i < NUM_SOUNDS; i++) {
@@ -2086,6 +2108,7 @@ void CameraService::playSound(sound_kind kind) {
 
     LOG1("playSound(%d)", kind);
     Mutex::Autolock lock(mSoundLock);
+    loadSoundLocked(kind);
     sp<MediaPlayer> player = mSoundPlayer[kind];
     if (player != 0) {
         player->seekTo(0);
@@ -2115,8 +2138,8 @@ CameraService::Client::Client(const sp<CameraService>& cameraService,
 
     mRemoteCallback = cameraClient;
 
-    cameraService->loadSound();
     cameraService->ensureCameraShutterSoundDisabled(clientPackageName);
+    cameraService->increaseSoundRef();
 
     LOG1("Client::Client X (pid %d, id %d)", callingPid, mCameraId);
 }
@@ -2142,7 +2165,7 @@ CameraService::Client::~Client() {
     ALOGV("~Client");
     mDestructionStarted = true;
 
-    sCameraService->releaseSound();
+    sCameraService->decreaseSoundRef();
     // unconditionally disconnect. function is idempotent
     Client::disconnect();
 }
@@ -2206,6 +2229,20 @@ CameraService::BasicClient::~BasicClient() {
 
 binder::Status CameraService::BasicClient::disconnect() {
     binder::Status res = Status::ok();
+
+#ifdef TARGET_MOTORIZED_CAMERA
+    std::string camId = mCameraIdStr.string();
+    time_t now = time(0);
+    double dif = difftime (now,motorTimeElapsed);
+    if (camId.compare("1") == 0) {
+        if (dif < 0.5) {
+            usleep (500000);
+        }
+        property_set("sys.camera.motor.direction", "down");
+        motorTimeElapsed = time(0);
+    }
+#endif
+
     if (mDisconnected) {
         return res;
     }
@@ -2309,11 +2346,7 @@ status_t CameraService::BasicClient::startCameraOps() {
 #ifdef TARGET_NEEDS_CLIENT_INFO
     std::ofstream cpf("/data/misc/camera/client_package_name");
     std::string cpn = String8(mClientPackageName).string();
-    if (cpn.compare("com.oneplus.camera") == 0) {
-        cpf << "com.oneplus.camera";
-    } else {
-        cpf << "";
-    }
+    cpf << cpn;
 #endif
     return OK;
 }
